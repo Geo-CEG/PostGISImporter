@@ -52,10 +52,6 @@ class importer(object):
     def create_schema(self):
         # TODO: only create if it does not already exist
 
-        password = self.password
-        if password == None:
-            password_arg = '--no-password' # Try running w/o a password.
-
         schemacmd = 'psql -c "CREATE SCHEMA %s;" -h %s -U %s --no-password --dbname=%s' % (self.schema, self.hostname, self.username, self.dbname)
         if not self.dryrun:
             os.system(schemacmd)
@@ -93,13 +89,21 @@ class importer(object):
 
         return
 
-    def _shp2pgsql_import(self, shapefilename, tablename):
+    def _shp2pgsql_import(self, pathname, tablename):
     
+        filename,extn = os.path.splitext(pathname)
+        sref_option = '-s %d' % self.sref
+        if extn.lower() == '.dbf': sref_option = '-n' # This is a table not a shapefile
+
         # d = drop table (generates a non-fatal error if it does not exist)
         # s = spatial reference (could be -s from:to)
+        # n = this is a table only, no geometry
 
-        shpcmd  = "shp2pgsql -d -s %d %s %s.%s" % (self.sref, shapefilename, self.schema, tablename)
-        psqlcmd = "psql --quiet -h %s -U %s --no-password --dbname=%s" % (self.hostname, self.username, self.dbname)
+        quiet = "--quiet"
+        #if debug: quiet = ""
+
+        shpcmd  = "shp2pgsql -d %s %s %s.%s" % (sref_option, pathname, self.schema, tablename)
+        psqlcmd = "psql %s -h %s -U %s --no-password --dbname=%s" % (quiet, self.hostname, self.username, self.dbname)
         cmd = shpcmd + " | " + psqlcmd
         dprint(cmd)
         if not self.dryrun:
@@ -114,12 +118,17 @@ class importer(object):
 
         self.create_schema()
     
-        for (shapefilename, name) in list:
+        for (pathname, name) in list:
             tablename = sanitize_tablename(name)
-            if os.path.exists(shapefilename):
-                dprint("Importing %s => %s" % (shapefilename, tablename))
+
+            if os.path.exists(pathname):
+                filename,extn = os.path.splitext(pathname)
+                dprint("Importing %s => %s" % (pathname, tablename))
+
+                # NOTE I currently don't have code here to handle tables
                 #_ogr_import(shapefilename, tablename)
-                self._shp2pgsql_import(shapefilename, tablename)
+                # ...but shp2pgsql DOES handle DBF tables
+                self._shp2pgsql_import(pathname, tablename)
             else:
                 eprint("Can't find %s" % pathname)
         return
@@ -144,7 +153,7 @@ if __name__ == '__main__':
     #username = 'gis_owner'
     #password = None
 
-    d_county = '/Users/bwilson/ownCloud/DataRepository/OR/LincolnCounty'
+    d_county = '/Users/bwilson/ownCloud/GIS/Data_Repository/OR/LincolnCounty'
     sref = 2913
     schema = 'or_co_lincoln'
     username = os.environ['GISOWNER']
@@ -163,9 +172,14 @@ if __name__ == '__main__':
     with open("list.txt") as fp:
         for item in fp.readlines():
             pair = item.split()
-            if os.path.exists(pair[0]):
+            try:
+                pathname = pair[0]
+            except RangeError as e:
+                continue
+            if os.path.exists(pathname):
                 if len(pair)<2:
-                    name,ext = os.path.splitext(pair[0])
+                    p,n = os.path.split(path)
+                    name,ext = os.path.splitext(n)
                     pair.append(name)
                 list.append(pair)
             else:
@@ -176,9 +190,8 @@ if __name__ == '__main__':
     imp = importer(schema=schema, sref=sref)
     #imp.dryrun = True
     
-    # Using default for username and don't need a password
-    self.username = username
-    self.hostname = hostname
+    imp.username = username
+    imp.hostname = hostname
     
     imp.do_import(list);
 
