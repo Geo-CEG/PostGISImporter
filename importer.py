@@ -9,6 +9,8 @@ from osgeo import ogr
 shp_driver = ogr.GetDriverByName('ESRI Shapefile')
 fgdb_driver = ogr.GetDriverByName('OpenFileGDB') # There is an ESRI driver too but this one is bundled with GDAL.
 pg_driver = ogr.GetDriverByName('PostgreSQL')
+if not shp_driver or not fgdb_driver or not pg_driver:
+    raise Exception('Required GDAL driver is missing.')
 
 debug = False
 
@@ -38,36 +40,34 @@ class importer(object):
 
     sref = 3857 # Web Mercator is a default, you should pick something
 
-    schema = None              # you have to set this
     dbname = 'gis_data'
     hostname = 'localhost'
     username = 'gis_owner'     # NB password should be in your .pgpass file if needed.
     dataSink = None
 
-    def __init__(self, schema=None, sref=3857):
-        self.schema = schema
-        self.sref = sref
+    def __init__(self):
         pass
 
-    def create_schema(self):
+    def create_schema(self, schema):
         # TODO: only create if it does not already exist
 
-        schemacmd = 'psql -c "CREATE SCHEMA %s;" -h %s -U %s --no-password --dbname=%s' % (self.schema, self.hostname, self.username, self.dbname)
+        schemacmd = 'psql -c "CREATE SCHEMA %s;" -h %s -U %s --no-password --dbname=%s' % (schema, self.hostname, self.username, self.dbname)
         if not self.dryrun:
             os.system(schemacmd)
         return
 
+    def _connstr(self):
+        return "PG:host='%s' dbname='%s' active_schema=%s user='%s'" % (self.hostname, self.dbname, self.schema, self.username)
+        
     def _ogr_import(shapefilename, tablename):
         """ Import a shapefile into a database table. """
 
-        connstr  = "PG:dbname='%s' active_schema=%s username='%s'" % (self.dbname, self.schema, self.username)
         if not self.dataSink:
             try:
-                dataSink = pg_driver.Open(connstr, True)
+                dataSink = pg_driver.Open(self._connstr(), True)
             except Exception as e:
                 eprint("Could not open PostGIS:", e)
-                dprint(connstr)
-                return
+                raise Exception('Could not open PostGIS connection, '+e.message)
 
         try :
             dataSource = shp_driver.Open(shapefilename, 0)
@@ -81,7 +81,7 @@ class importer(object):
         layer = dataSource.GetLayer(0)
         layerName = layer.GetName();
     
-        dprint("Copying %d features from %s to %s" % (layer.GetFeatureCount(), layerName, connstr + ' ' + tablename))
+        dprint("Copying %d features %s -> %s" % (layer.GetFeatureCount(), layerName, tablename))
         if not self.dryrun:
             pg_layer = dataSink.CopyLayer(layer, tablename)
             if pg_layer is None:
@@ -92,12 +92,13 @@ class importer(object):
     def _shp2pgsql_import(self, pathname, tablename):
     
         filename,extn = os.path.splitext(pathname)
-        sref_option = '-s %d' % self.sref
+        sref_option = '-s %s' % self.sref
         if extn.lower() == '.dbf': sref_option = '-n' # This is a table not a shapefile
 
         # d = drop table (generates a non-fatal error if it does not exist)
         # s = spatial reference (could be -s from:to)
         # n = this is a table only, no geometry
+        # I = create spatial index
 
         quiet = "--quiet"
         #if debug: quiet = ""
@@ -110,25 +111,65 @@ class importer(object):
             os.system(cmd)
         return
 
+    def _gdb_import(self, pathname, layername=None):
+        if not self.dataSink:
+            try:
+                dataSink = pg_driver.Open(self._connstr(), True)
+            except Exception as e:
+                raise Exception('Could not open PostGIS connection, '+e.message)
+        try:
+            dataSource = fgdb_driver.Open(pathname, 0)
+            if dataSource is None:
+                eprint("Could not open geodatabase:", pathname)
+                return
+        except Exception as e:
+            eprint("Could not open geodatabase:", pathfilename, e)
+            return
+
+        layer = dataSource.GetLayer(0)
+        i=0
+        while (layer):
+            layerName = layer.GetName();
+            tablename = layerName
+            dprint("Copying %d features %s -> %s" % (layer.GetFeatureCount(), layerName, tablename))
+            if not self.dryrun:
+                pg_layer = dataSink.CopyLayer(layer, tablename)
+                if pg_layer is None:
+                    eprint("Layer copy failed on", tablename)
+            i += 1
+            layer = dataSource.GetLayer(i)
+        return
+
+
     def do_import(self, list):
         """ NB: This will overwrite out any existing data!!! """
 
         if not self.dbname: raise Exception("database name is not set.")
-        if not self.schema: raise Exception("schema is not set.")
 
-        self.create_schema()
-    
-        for (pathname, name) in list:
+        already_got_this_one = {}
+        for (schema, sref, pathname, name) in list:
+
+            if not schema: raise Exception("schema is not set.")
+            if not already_got_this_one.has_key(schema):
+                self.create_schema(schema)
+                already_got_this_one[schema] = 1
+            self.schema = schema
+            self.sref = sref
+
             tablename = sanitize_tablename(name)
 
             if os.path.exists(pathname):
                 filename,extn = os.path.splitext(pathname)
                 dprint("Importing %s => %s" % (pathname, tablename))
 
-                # NOTE I currently don't have code here to handle tables
-                #_ogr_import(shapefilename, tablename)
-                # ...but shp2pgsql DOES handle DBF tables
-                self._shp2pgsql_import(pathname, tablename)
+                if extn == '.gdb':
+                    self._gdb_import(pathname)
+                    continue
+                else:
+                    # NOTE I currently don't have code here to handle tables
+                    #_ogr_import(shapefilename, tablename)
+                    # ...but shp2pgsql DOES handle DBF tables
+                    self._shp2pgsql_import(pathname, tablename)
             else:
                 eprint("Can't find %s" % pathname)
         return
@@ -144,23 +185,22 @@ if __name__ == '__main__':
 
     debug  = True
 
+    # Chdir to the directory containing the list.txt file that will
+    # guide this script. Then run this script.
+
     # You have to figure out the correct EPSG code to use for your data.
     # I suggest feeding a PRJ file to http://prj2epsg.org/search
 
-    #d_county = '/home/GISData/CA/Marin' # directory containing the source data
     #sref = 2872 # NAD_1983_HARN_StatePlane_California_III_FIPS_0403_Feet
-    #schema   = "ca_co_marin"
     #username = 'gis_owner'
     #password = None
 
-    d_county = '/Users/bwilson/ownCloud/GIS/Data_Repository/OR/LincolnCounty'
+    # Oh come on now put this in the list.txt file.
+
     sref = 2913
-    schema = 'or_co_lincoln'
-    username = os.environ['GISOWNER']
+    username = 'gis_owner'
     hostname = 'dart.wildsong.biz'
     
-    os.chdir(d_county)
-
 # list.txt contains a list of shapefiles to import
 # and optionally the table name to use in output, for example
 #
@@ -168,26 +208,43 @@ if __name__ == '__main__':
 #
 # imports the shapefile trails.shp into a table "trail".
 
+    schema = None
     list = [];
     with open("list.txt") as fp:
         for item in fp.readlines():
+
+            item = item.strip()
+            if not item: continue # Skip empty lines
+            if item[0]=='#': continue # Skip comments
+
             pair = item.split()
             try:
                 pathname = pair[0]
             except RangeError as e:
                 continue
+
+            p,n = os.path.split(pathname)
+
+            if len(pair)<2:
+                # There is no tablename so create one.
+                name,ext = os.path.splitext(n)
+                pair.append(name)
+
+            if pair[0].lower() == 'schema':
+                schema = pair[1]
+                continue
+            if pair[0].lower() == 'epsg':
+                sref = pair[1]
+                continue
+
             if os.path.exists(pathname):
-                if len(pair)<2:
-                    p,n = os.path.split(path)
-                    name,ext = os.path.splitext(n)
-                    pair.append(name)
-                list.append(pair)
+                list.append([schema,sref]+pair)
             else:
-                eprint("There is no file '%s', skipping it." % pair[0])
+                eprint("Can't open '%s', skipping it." % pathname)
 
     dprint(list)
 
-    imp = importer(schema=schema, sref=sref)
+    imp = importer()
     #imp.dryrun = True
     
     imp.username = username
