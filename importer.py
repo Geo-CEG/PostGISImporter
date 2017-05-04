@@ -1,16 +1,25 @@
-#!/usr/bin/env python
+#!/usr/bin/env python -u
 #
 #   Generic script for importing GIS data into PostGIS
+#   Not so generic rules for importing USDA SSURGO data.
 #
 from __future__ import print_function
 import sys, os
 from osgeo import ogr
+import psycopg2
+from psycopg2.extensions import AsIs
+import csv
 
 shp_driver = ogr.GetDriverByName('ESRI Shapefile')
 fgdb_driver = ogr.GetDriverByName('OpenFileGDB') # There is an ESRI driver too but this one is bundled with GDAL.
 pg_driver = ogr.GetDriverByName('PostgreSQL')
-if not shp_driver or not fgdb_driver or not pg_driver:
-    raise Exception('Required GDAL driver is missing.')
+csv_driver = ogr.GetDriverByName('CSV')
+if not shp_driver:
+    raise Exception('Required GDAL Shapefile driver is missing.')
+if not fgdb_driver:
+    raise Exception('Required GDAL OpenFileGDB driver is missing.')
+if not pg_driver:
+    raise Exception('Required GDAL PostgreSQL driver is missing.')
 
 debug = False
 
@@ -27,16 +36,9 @@ def sanitize_tablename(tablename):
     
 class importer(object):
 
-    #  There are two methods for import included here,
-    #  _ogr_import() calls the osgeo gdal ogr code
-    #  _shp2pgsql_import() uses a subprocess to call shp2pgsql.
-    #  You have to pick one or the other in do_import().
-    #
-    #  TODO: evaluate the merits and say why one is better than the other.
-    #
-
     # If set to true just set up commands, don't do database writes
     dryrun = False
+    dryrun = True
 
     sref = 3857 # Web Mercator is a default, you should pick something
 
@@ -44,79 +46,86 @@ class importer(object):
     hostname = 'localhost'
     username = 'gis_owner'     # NB password should be in your .pgpass file if needed.
     dataSink = None
-
+    overwrite = True
+    
+    # SSURGO special variables
+    dcolumn = {} # indexed by table, contains column definitions
+    dtype = {} # variable types collected from TXT file, used to map SSURGO types to SQL types
+    
     def __init__(self):
         pass
 
     def create_schema(self, schema):
-        # TODO: only create if it does not already exist
-
-        schemacmd = 'psql -c "CREATE SCHEMA %s;" -h %s -U %s --no-password --dbname=%s' % (schema, self.hostname, self.username, self.dbname)
-        if not self.dryrun:
-            os.system(schemacmd)
+        dsn = "host='%s' dbname='%s' user='%s'" % (self.hostname, self.dbname, self.username)
+        with psycopg2.connect(dsn) as conn:
+            cursor = conn.cursor()
+            try:
+                result = cursor.execute("""CREATE SCHEMA %s""", (AsIs(schema),))
+                pass
+            except psycopg2.ProgrammingError as e:
+                if e.message.find('already exists') == -1:
+                    raise e
+                pass
         return
 
-    def _connstr(self):
-        return "PG:host='%s' dbname='%s' active_schema=%s user='%s'" % (self.hostname, self.dbname, self.schema, self.username)
+    def _pg_connect(self):
+        connstr = "PG:host='%s' dbname='%s' active_schema=%s user='%s'" % (self.hostname, self.dbname, self.schema, self.username)
+        try:
+            dataSink = pg_driver.Open(connstr, True)
+        except Exception as e:
+            raise Exception('Could not open PostGIS connection, '+e.message)
+        return dataSink
+
+    def prj2epsg(prj_file):
+        srs = osr.SpatialReference()
+        with open(shapeprj_path, 'r') as prj_file:
+            prj_txt = prj_file.read()
+        srs.ImportFromESRI([prj_txt])
+        dprint('Shape prj is: %s' % prj_txt)
+        dprint('WKT is: %s' % srs.ExportToWkt())
+        dprint('Proj4 is: %s' % srs.ExportToProj4())
+        srs.AutoIdentifyEPSG()
+        return srs.GetAuthorityCode(None)
         
-    def _ogr_import(shapefilename, tablename):
-        """ Import a shapefile into a database table. """
+    def _vector_import(self, pathname, tablename):
+        """ Import a feature class into a database table.
+        shapefilename can have an extension of .shp or .dbf;
+        if you give it a dbf file it will be treated as tabular data. """
 
-        if not self.dataSink:
-            try:
-                dataSink = pg_driver.Open(self._connstr(), True)
-            except Exception as e:
-                eprint("Could not open PostGIS:", e)
-                raise Exception('Could not open PostGIS connection, '+e.message)
+        dataSink = self._pg_connect()
+        options = []
+        if self.overwrite: options.append("OVERWRITE=YES")
 
+        # Let's figure out the projection.
+        prjname,ext = os.path.splitext(pathname)
+        sref = prj2epsg(prjname+'.prj')
+        print('sref = %s' % sref)
         try :
-            dataSource = shp_driver.Open(shapefilename, 0)
+            dataSource = shp_driver.Open(pathname, 0)
             if dataSource is None:
-                eprint("Could not open file geodatabase:", shapefilename)
+                eprint("Could not open file:", pathname)
                 return
         except Exception as e:
-            eprint("Exception: Could not open shapefile:", shapefilename, e)
+            eprint("Exception: Could not open file:", pathname, e)
             return
 
         layer = dataSource.GetLayer(0)
         layerName = layer.GetName();
     
-        dprint("Copying %d features %s -> %s" % (layer.GetFeatureCount(), layerName, tablename))
-        if not self.dryrun:
-            pg_layer = dataSink.CopyLayer(layer, tablename)
-            if pg_layer is None:
-                eprint("Layer copy failed on", tablename)
-
-        return
-
-    def _shp2pgsql_import(self, pathname, tablename):
-    
-        filename,extn = os.path.splitext(pathname)
-        sref_option = '-s %s' % self.sref
-        if extn.lower() == '.dbf': sref_option = '-n' # This is a table not a shapefile
-
-        # d = drop table (generates a non-fatal error if it does not exist)
-        # s = spatial reference (could be -s from:to)
-        # n = this is a table only, no geometry
-        # I = create spatial index
-
-        quiet = "--quiet"
-        #if debug: quiet = ""
-
-        shpcmd  = "shp2pgsql -d %s %s %s.%s" % (sref_option, pathname, self.schema, tablename)
-        psqlcmd = "psql %s -h %s -U %s --no-password --dbname=%s" % (quiet, self.hostname, self.username, self.dbname)
-        cmd = shpcmd + " | " + psqlcmd
-        dprint(cmd)
-        if not self.dryrun:
-            os.system(cmd)
+        feature_count = layer.GetFeatureCount()
+        if feature_count:
+            dprint("Shapefile: %d features %s -> %s.%s" % (feature_count, layerName, self.schema, tablename))
+            if not self.dryrun:
+                pg_layer = dataSink.CopyLayer(layer, tablename, options)
+                if pg_layer is None:
+                    eprint("Copy failed on", tablename)
+        else:
+            dprint("Skipping, no features: '%s'" % layerName)
+        
         return
 
     def _gdb_import(self, pathname, layername=None):
-        if not self.dataSink:
-            try:
-                dataSink = pg_driver.Open(self._connstr(), True)
-            except Exception as e:
-                raise Exception('Could not open PostGIS connection, '+e.message)
+        dataSink = self._pg_connect()
         try:
             dataSource = fgdb_driver.Open(pathname, 0)
             if dataSource is None:
@@ -125,22 +134,148 @@ class importer(object):
         except Exception as e:
             eprint("Could not open geodatabase:", pathfilename, e)
             return
-
+        options = []
+        if self.overwrite: options.append("OVERWRITE=YES")
         layer = dataSource.GetLayer(0)
         i=0
         while (layer):
-            layerName = layer.GetName();
-            tablename = layerName
-            dprint("Copying %d features %s -> %s" % (layer.GetFeatureCount(), layerName, tablename))
-            if not self.dryrun:
-                pg_layer = dataSink.CopyLayer(layer, tablename)
-                if pg_layer is None:
-                    eprint("Layer copy failed on", tablename)
+            layername = layer.GetName();
+            tablename = layername
+            feature_count = layer.GetFeatureCount()
+            if feature_count:
+                dprint("FGDB %d features %s -> %s.%s" % (feature_count, layername, self.schema,tablename))
+                if not self.dryrun:
+                    pg_layer = dataSink.CopyLayer(layer, tablename, options)
+                    if pg_layer is None:
+                        eprint("Copy failed on '%s'" % tablename)
+            else:
+                dprint("FGDB: skipping empty '%s'" % layername)
             i += 1
             layer = dataSource.GetLayer(i)
         return
+    
+    def read_table_definitions(self, file):
+        """ This is informative but I am not really using it yet. """
+        table_defn = [ 'basename', 'alt_name', 'descriptive_name', 'description', 'short_name' ]
+        with open(file, "r") as fp:
+            rdr = csv.reader(fp, delimiter='|')
+            for row in rdr:
+                self.dtable[row[0]] = (row[2],row[3])
+        return
+    
+    def _read_column_definitions(self, folder, file):
+        """ Read an mstabcol.txt file and build a dictionary,
+        each key is a table name and it contains a list of variables in that table. """
+        if self.dcolumn:
+            return True # done already!
+        
+        boolval = False
+        with open(os.path.join(folder, file), "r") as fp:
+            rdr = csv.reader(fp, delimiter='|')
+            for row in rdr:
+                table = row[0]
+        
+                # For column definitions see mdstattabcols.txt
+                # each tuple contains columnseq,varname, vartype,notnull,fieldsize, and wordy description
+        
+                tuple = (row[1],row[2],row[3],  row[5],row[6],row[7],  row[13])
+                self.dtype[row[5]] = row[6]
+                try:
+                    self.dcolumn[table].append(tuple)
+                except KeyError:
+                    self.dcolumn[table] = [tuple]
+            boolval = True
+        return boolval
+        
+    def _csv_import(self, pathname, table):
+        dsn = "host='%s' dbname='%s' user='%s'" % (self.hostname, self.dbname, self.username)
+        conn = psycopg2.connect(dsn)
+        cursor = conn.cursor()
+        fp = open(pathname, "r")
+        cursor.copy_from(fp, table, sep='|')
+        return
+    
+    def _ssurgo_import(self, folder):
+        """ Import all the SSURGO data tables from a folder. """
+        dsn = "host='%s' dbname='%s' user='%s'" % (self.hostname, self.dbname, self.username)
 
+        lut = {'Integer':   """BIGINT""",
+               'Vtext':     """TEXT""",
+               'Boolean':   """BOOLEAN""",
+               'Choice':    """VARCHAR(%s)""",
+               'String':    """VARCHAR(%s)""",
+                'Float':     """FLOAT(8)""",
+               'Date/Time': """TIMESTAMP""",}
+        
+        self._read_column_definitions(folder, 'mstabcol.txt')
 
+        with psycopg2.connect(dsn) as conn:
+            cursor = conn.cursor()
+            
+            for table in self.dcolumn:
+                query = """CREATE TABLE %s.%s (\n"""
+                params = [AsIs(self.schema),AsIs(table)]
+                insert_params = ""
+                addcomma=False
+                tablepath = os.path.join(folder, table+'.txt')
+                if not os.path.exists(tablepath):
+                    continue
+                for col in self.dcolumn[table]:
+                    index    = col[0]
+                    phyname  = col[1]
+                    logname  = col[2]
+                    typecol  = col[3]
+                    notnull  = col[4]
+                    size     = col[5]
+                    desc     = col[6]
+                    sqltype  = lut[typecol] # this can throw errors if lut is missing an entry
+                    #print(col)
+                    try:
+                        tdef = sqltype % size
+                    except TypeError:
+                        tdef = sqltype # This happens when size is None and is normal
+
+                    if addcomma: query += ',\n'
+                    query += "  %s %s"
+                    if notnull == 'Yes':
+                        query += " NOT NULL"
+                    
+                    name=phyname
+                    if phyname=='notnull':
+                        name = logname
+                    params += [AsIs(name), AsIs(tdef)]
+                    if addcomma: insert_params += ','
+                    insert_params += name
+                    addcomma = True
+                    pass
+                query += ");"
+                #print(cursor.mogrify(query, params))
+                rval = cursor.execute("DROP TABLE IF EXISTS %s.%s;", (AsIs(self.schema),AsIs(table),))
+                rval = cursor.execute(query, params)
+
+                with open(tablepath, "r") as fp:
+                    csv_reader = csv.reader(fp, delimiter='|')
+                    for row in csv_reader:
+                        query = """INSERT INTO %s.%s VALUES (""" + ','.join(["%s"]*len(row)) + ");"
+                        
+                        # Replace empty strings with NULL to avoid type conversion problem
+                        nulled=[]
+                        for element in row:
+                            if not element:
+                                nulled.append(AsIs('NULL'))
+                            else:
+                                nulled.append(element)
+                                
+                        params = [AsIs(schema), AsIs(table),]+nulled
+                        #code = cursor.mogrify(query, params)
+                        #print(code)
+                        rval = cursor.execute(query,params)
+                        pass
+                pass
+                #cursor.copy_from(fp, table, sep='|')
+
+        return
+    
     def do_import(self, list):
         """ NB: This will overwrite out any existing data!!! """
 
@@ -154,24 +289,21 @@ class importer(object):
                 self.create_schema(schema)
                 already_got_this_one[schema] = 1
             self.schema = schema
-            self.sref = sref
 
-            tablename = sanitize_tablename(name)
+            if sref == 'ssurgo':
+                self._ssurgo_import(pathname)
+                continue
+            else:
+                self.sref = sref
+                tablename = sanitize_tablename(name)
 
-            if os.path.exists(pathname):
                 filename,extn = os.path.splitext(pathname)
-                dprint("Importing %s => %s" % (pathname, tablename))
-
                 if extn == '.gdb':
                     self._gdb_import(pathname)
-                    continue
+                elif extn == '.csv' or extn == '.txt':
+                    self._csv_import(pathname, tablename)
                 else:
-                    # NOTE I currently don't have code here to handle tables
-                    #_ogr_import(shapefilename, tablename)
-                    # ...but shp2pgsql DOES handle DBF tables
-                    self._shp2pgsql_import(pathname, tablename)
-            else:
-                eprint("Can't find %s" % pathname)
+                    self._vector_import(pathname, tablename)
         return
 
 ####################################################
@@ -210,7 +342,9 @@ if __name__ == '__main__':
 
     schema = None
     list = [];
-    with open("list.txt") as fp:
+    file = "list.txt"
+#    file = "ssurgo.txt"
+    with open(file,'r') as fp:
         for item in fp.readlines():
 
             item = item.strip()
@@ -222,6 +356,8 @@ if __name__ == '__main__':
                 pathname = pair[0]
             except RangeError as e:
                 continue
+            
+            if pair[0] == 'exit': break
 
             p,n = os.path.split(pathname)
 
@@ -230,26 +366,28 @@ if __name__ == '__main__':
                 name,ext = os.path.splitext(n)
                 pair.append(name)
 
-            if pair[0].lower() == 'schema':
+            first = pair[0].lower()
+            if first == 'schema':
                 schema = pair[1]
                 continue
-            if pair[0].lower() == 'epsg':
+            elif first == 'epsg':
                 sref = pair[1]
                 continue
-
-            if os.path.exists(pathname):
-                list.append([schema,sref]+pair)
+            elif first == 'ssurgo':
+                list.append([schema,'ssurgo',pair[1],None])
             else:
-                eprint("Can't open '%s', skipping it." % pathname)
+                #if os.path.exists(pathname):
+                list.append([schema,sref]+pair)
 
-    dprint(list)
+    #dprint(list)
 
     imp = importer()
-    #imp.dryrun = True
-    
+    imp.overwrite = False
     imp.username = username
     imp.hostname = hostname
     
     imp.do_import(list);
+    
+    print("importer has completed.")
 
     sys.exit(0)
